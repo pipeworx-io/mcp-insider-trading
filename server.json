@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/insider-trading",
   "title": "Insider Trading",
   "description": "Insider Trading MCP — SEC EDGAR insider filings and material events",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/insider-trading",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-insider-trading",

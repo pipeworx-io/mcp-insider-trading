@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -671,6 +687,254 @@ function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
+
 
 // Reusable entity-resolution helpers for MCP packs. SELF-CONTAINED — no internal
 // imports — so publish-pack.sh can inline it into standalone pack builds the same
@@ -714,23 +978,62 @@ function rankMatches<T>(
   query: string,
   items: T[],
   getName: (item: T) => string,
+  getAliases?: (item: T) => string[],
 ): RankedMatch<T>[] {
   const q = normalize(query);
   if (!q) return [];
   const scored: { item: T; kind: MatchKind; score: number; len: number }[] = [];
   for (const item of items) {
     const name = getName(item);
-    const n = normalize(name);
+    // `getAliases` (optional, fleet #3607) are OTHER spellings of the same name,
+    // each scored on its own; the best-scoring spelling wins. Additive on
+    // purpose: the raw name is always tried, so a query that already matched
+    // keeps matching exactly as before, and an alias can only ADD a match.
     let kind: MatchKind | null = null;
     let score = 0;
-    if (n === q) { kind = 'exact'; score = 4; }
-    else if (n.startsWith(`${q} `)) { kind = 'prefix'; score = 3; }
-    else if (n.includes(` ${q} `) || n.endsWith(` ${q}`)) { kind = 'word'; score = 2; }
-    else if (n.includes(q)) { kind = 'substring'; score = 1; }
+    for (const spelling of [name, ...(getAliases?.(item) ?? [])]) {
+      const n = normalize(spelling);
+      let k: MatchKind | null = null;
+      let sc = 0;
+      if (n === q) { k = 'exact'; sc = 4; }
+      else if (n.startsWith(`${q} `)) { k = 'prefix'; sc = 3; }
+      else if (n.includes(` ${q} `) || n.endsWith(` ${q}`)) { k = 'word'; sc = 2; }
+      else if (n.includes(q)) { k = 'substring'; sc = 1; }
+      if (k && sc > score) { kind = k; score = sc; }
+    }
     if (kind) scored.push({ item, kind, score, len: name.length });
   }
   scored.sort((a, b) => b.score - a.score || a.len - b.len);
   return scored.map(({ item, kind, score }) => ({ item, kind, score }));
+}
+
+/**
+ * The trailing designators EDGAR appends to a registrant name that are NOT part
+ * of the company's name: state or country of incorporation ("/DE/", "/MD",
+ * "/CAN/", "/Cayman"), "/NEW", and the ADR marker. Matched case-insensitively
+ * against the WHOLE segment after the last slash, so a name with a slash INSIDE
+ * it ("CULLEN/FROST BANKERS", "M/I HOMES", "Quad/Graphics", "DATA I/O CORP",
+ * "GENMAB A/S") is never cut. A genuine legal form that happens to look like a
+ * 2-letter designator ("Anheuser-Busch InBev SA/NV") gains an extra alias
+ * ("...SA"); the raw title is always tried too, so that costs nothing. Measured
+ * against SEC's company_tickers.json 2026-10-26: 951 of 10,429 titles carry a
+ * slash; the trailing segments are ADR (545), CAN, state codes, NEW, CAYMAN,
+ * DEL(AWARE), CANADA, JAPAN, or empty ("TOYOTA MOTOR CORP/").
+ */
+const EDGAR_TRAILING_DESIGNATOR =
+  /\s*\/\s*(?:[A-Za-z]{2}|ADR|CAN|NEW|CAYMAN|DEL|DELAWARE|CANADA|JAPAN|UK)?\s*\/?\s*$/i;
+
+/**
+ * Other spellings of an EDGAR registrant title that name the same company:
+ * the title with its jurisdiction/ADR designator removed ("TOYOTA MOTOR CORP/"
+ * -> "TOYOTA MOTOR CORP"). Empty when there is nothing to remove. Used as
+ * `rankMatches`'s aliases, never as a replacement for the title (fleet #3607).
+ * Deliberately NOT a change to `normalize`: that is shared by every pack that
+ * ranks its own list, and "/" is not a registrant-name artefact in those.
+ */
+function edgarNameAliases(title: string): string[] {
+  const stripped = title.replace(EDGAR_TRAILING_DESIGNATOR, '').trim();
+  return stripped && stripped !== title.trim() && /\S/.test(stripped) ? [stripped] : [];
 }
 
 interface SecTickerRow { cik_str: number; ticker: string; title: string }
@@ -749,6 +1052,13 @@ interface SecEntity {
    * `matched_by: 'company_name'` alone cannot (fleet #3100).
    */
   matched_kind?: MatchKind;
+  /**
+   * Other companies whose names also matched — distinct companies, deduped
+   * by CIK, excluding this issuer's own share classes (never the winner's
+   * own ticker/CIK under a different symbol). Consumers read this to tell a
+   * genuinely CONTESTED name match from a clean one. See
+   * `distinctCompanyAlternatives` below for how it's built (fleet #3621).
+   */
   alternatives?: { ticker: string; company_name: string; cik: string; kind: MatchKind }[];
 }
 
@@ -782,21 +1092,43 @@ async function resolveSecEntity(
   }
 
   // 2) Company-name fallback.
-  const ranked = rankMatches(query, rows, (r) => r.title);
+  const ranked = rankMatches(query, rows, (r) => r.title, (r) => edgarNameAliases(r.title));
   if (ranked.length) {
     const best = toEntity(ranked[0].item, 'company_name');
     best.matched_kind = ranked[0].kind;
-    const alts = ranked.slice(1, 4).map((m) => ({
-      ticker: m.item.ticker,
-      company_name: m.item.title,
-      cik: String(m.item.cik_str),
-      kind: m.kind,
-    }));
+    const alts = distinctCompanyAlternatives(ranked);
     if (alts.length) best.alternatives = alts;
     return best;
   }
 
   throw new Error(`No SEC company matches "${query}". Pass a US-listed ticker ("AAPL") or the exact listed-company name ("Apple Inc."). If this is a clinical-trial sponsor, an operating subsidiary (e.g. "Merck Sharp & Dohme" → Merck & Co), or a foreign/private entity, call sponsor_to_filer({sponsor}) instead — it resolves subsidiaries to the listed parent and honestly reports when no US-listed filer exists.`);
+}
+
+/** `alternatives` lists at most this many OTHER companies; company-spine.test.ts pins it to the real function. */
+const ALTERNATIVES_CAP = 3;
+
+/**
+ * The runners-up for a name match, as DISTINCT COMPANIES (fleet #3621).
+ *
+ * company_tickers.json lists one row per ticker, so an issuer with preferred
+ * shares appears several times under one CIK (Ford: F, F-PB, F-PC, F-PD; AT&T:
+ * T, TBB, T-PA, T-PC). Slicing the ranked rows left those rows to fill every
+ * alternatives slot, hiding any real rival ranked behind them, and made a company
+ * its own "alternative". So: drop every row that is the winner's own CIK, keep
+ * only the best-ranked row of each other CIK, THEN cap. The winner's other
+ * tickers are not lost information: they are the same company, and `ticker` /
+ * `cik` already identify it. `ranked` is already best-first, so first-seen wins.
+ */
+function distinctCompanyAlternatives(ranked: RankedMatch<SecTickerRow>[]): NonNullable<SecEntity['alternatives']> {
+  const seen = new Set<number>([ranked[0].item.cik_str]);
+  const out: NonNullable<SecEntity['alternatives']> = [];
+  for (const m of ranked.slice(1)) {
+    if (seen.has(m.item.cik_str)) continue;
+    seen.add(m.item.cik_str);
+    out.push({ ticker: m.item.ticker, company_name: m.item.title, cik: String(m.item.cik_str), kind: m.kind });
+    if (out.length >= ALTERNATIVES_CAP) break;
+  }
+  return out;
 }
 
 function toEntity(r: SecTickerRow, matched_by: 'ticker' | 'company_name'): SecEntity {

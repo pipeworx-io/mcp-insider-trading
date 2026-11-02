@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-insider-trading",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Insider Trading MCP — SEC EDGAR insider filings and material events",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "insider-trading",
     "gatewaySlug": "insider-trading",
-    "sourceHash": "v1-0f74dc6fa3db7cf27186b492428a7af2cfd4d4a10b8b0eecb758c4b5b015580a",
-    "sourceCommit": "4844029e402d6bd2fe735add8abf6d46735f8ed5"
+    "sourceHash": "v1-f66af26a6e04d4b02062f3a041ae4404253a2575bc998ca6eb4884378d524deb",
+    "sourceCommit": "0ca9712c0ac03bb0121cc7e81b202d0c45ac02ca"
   }
 }
